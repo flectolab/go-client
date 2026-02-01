@@ -16,6 +16,8 @@ github.com/flectolab/flecto-manager/common v0.0.0-20260124155524-91d818373375 h1
 github.com/flectolab/flecto-manager/common v0.0.0-20260124155524-91d818373375/go.mod h1:PaM+Q7vqi9F4eHF2xNLEc+TVE/Af8lgn3caDFGZcF64=
 github.com/flectolab/flecto-manager/common v0.0.1 h1:2os9S+J5KormT2h4+UE37pQ4UM474JJdvSfx2Rqc2GU=
 github.com/flectolab/flecto-manager/common v0.0.1/go.mod h1:PaM+Q7vqi9F4eHF2xNLEc+TVE/Af8lgn3caDFGZcF64=
+github.com/flectolab/flecto-manager/common v0.0.2 h1:66kBM1jddq05UKAWSZAwSu1OhyLRvu3YksX/Cj6ZIhI=
+github.com/flectolab/flecto-manager/common v0.0.2/go.mod h1:PaM+Q7vqi9F4eHF2xNLEc+TVE/Af8lgn3caDFGZcF64=
 github.com/jonboulle/clockwork v0.4.0 h1:p4Cf1aMWXnXAUh8lVfewRBx1zaTSYKrKMF2g3ST4RZ4=
 github.com/jonboulle/clockwork v0.4.0/go.mod h1:xgRqUGwRcjKCO1vbZUEtSLrqKoPSsUpK7fnezOII0kc=
 github.com/jonboulle/clockwork v0.5.0 h1:Hyh9A8u51kptdkR+cqRpT1EebBwTn1oK9YfGYbdFz6I=
