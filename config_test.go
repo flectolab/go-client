@@ -15,6 +15,8 @@ func TestNewDefaultConfig(t *testing.T) {
 	assert.NotNil(t, cfg.Http.Client)
 	assert.Equal(t, "Authorization", cfg.Http.HeaderAuthorizationName)
 	assert.Equal(t, 5*time.Minute, cfg.IntervalCheck)
+	assert.Equal(t, DefaultRedirectsLimit, cfg.RedirectsLimit)
+	assert.Equal(t, DefaultPagesLimit, cfg.PagesLimit)
 	assert.Empty(t, cfg.ManagerUrl)
 	assert.Empty(t, cfg.NamespaceCode)
 	assert.Empty(t, cfg.ProjectCode)
@@ -296,6 +298,87 @@ func TestConfig_GetUrlApiAgentsHit(t *testing.T) {
 				ProjectCode:   tt.projectCode,
 			}
 			got := cfg.GetUrlApiAgentsHit(tt.agentName)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+func TestConfig_GetRedirectsLimit(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want int
+	}{
+		{
+			name: "unset falls back to the default",
+			cfg:  &Config{},
+			want: DefaultRedirectsLimit,
+		},
+		{
+			name: "zero falls back to the default",
+			cfg:  &Config{RedirectsLimit: 0},
+			want: DefaultRedirectsLimit,
+		},
+		{
+			name: "negative falls back to the default",
+			cfg:  &Config{RedirectsLimit: -10},
+			want: DefaultRedirectsLimit,
+		},
+		{
+			name: "positive value is used as is",
+			cfg:  &Config{RedirectsLimit: 42},
+			want: 42,
+		},
+		{
+			name: "the pages limit does not leak in",
+			cfg:  &Config{PagesLimit: 7},
+			want: DefaultRedirectsLimit,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.GetRedirectsLimit()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestConfig_GetPagesLimit(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want int
+	}{
+		{
+			name: "unset falls back to the default",
+			cfg:  &Config{},
+			want: DefaultPagesLimit,
+		},
+		{
+			name: "zero falls back to the default",
+			cfg:  &Config{PagesLimit: 0},
+			want: DefaultPagesLimit,
+		},
+		{
+			name: "negative falls back to the default",
+			cfg:  &Config{PagesLimit: -10},
+			want: DefaultPagesLimit,
+		},
+		{
+			name: "positive value is used as is",
+			cfg:  &Config{PagesLimit: 42},
+			want: 42,
+		},
+		{
+			name: "the redirects limit does not leak in",
+			cfg:  &Config{RedirectsLimit: 7},
+			want: DefaultPagesLimit,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.GetPagesLimit()
 			assert.Equal(t, tt.want, got)
 		})
 	}
