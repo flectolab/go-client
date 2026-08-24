@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -63,7 +64,9 @@ func newTestClient() (*client, *mockHTTPClient, clockwork.FakeClock) {
 			HeaderAuthorizationName: "Authorization",
 			TokenJWT:                "test-token",
 		},
-		IntervalCheck: 5 * time.Minute,
+		IntervalCheck:  5 * time.Minute,
+		RedirectsLimit: 100,
+		PagesLimit:     100,
 	}
 
 	c := &client{
@@ -187,7 +190,9 @@ func TestClient_Init_InvalidAgentType(t *testing.T) {
 			HeaderAuthorizationName: "Authorization",
 			TokenJWT:                "test-token",
 		},
-		IntervalCheck: 5 * time.Minute,
+		IntervalCheck:  5 * time.Minute,
+		RedirectsLimit: 100,
+		PagesLimit:     100,
 	}
 
 	c := &client{
@@ -1189,4 +1194,351 @@ func TestClient_sendAgentHit_NewRequestError(t *testing.T) {
 	err := c.sendAgentHit("test-node")
 
 	assert.Error(t, err)
+}
+
+// makeListResponse serializes a listing envelope as an HTTP 200 body.
+func makeListResponse(payload any) *http.Response {
+	body, _ := json.Marshal(payload)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewBuffer(body)),
+	}
+}
+
+// redirectsRange builds n redirects sourced /r{start}../r{start+n-1}, so a walk
+// can be checked for order and for duplicates.
+func redirectsRange(start, n int) []types.Redirect {
+	items := make([]types.Redirect, n)
+	for i := 0; i < n; i++ {
+		items[i] = types.Redirect{
+			Type:   types.RedirectTypeBasic,
+			Source: fmt.Sprintf("/r%d", start+i),
+			Target: "/target",
+			Status: types.RedirectStatusMovedPermanent,
+		}
+	}
+	return items
+}
+
+func redirectSources(redirects []types.Redirect) []string {
+	sources := make([]string, len(redirects))
+	for i := range redirects {
+		sources[i] = redirects[i].Source
+	}
+	return sources
+}
+
+// pagesRange builds n pages pathed /p{start}../p{start+n-1}.
+func pagesRange(start, n int) []types.Page {
+	items := make([]types.Page, n)
+	for i := 0; i < n; i++ {
+		items[i] = types.Page{
+			Type:        types.PageTypeBasic,
+			Path:        fmt.Sprintf("/p%d", start+i),
+			Content:     "content",
+			ContentType: types.PageContentTypeTextPlain,
+		}
+	}
+	return items
+}
+
+func pagePaths(pages []types.Page) []string {
+	paths := make([]string, len(pages))
+	for i := range pages {
+		paths[i] = pages[i].Path
+	}
+	return paths
+}
+
+func queriesOf(calls []*http.Request) []string {
+	queries := make([]string, 0, len(calls))
+	for _, req := range calls {
+		queries = append(queries, req.URL.RawQuery)
+	}
+	return queries
+}
+
+func TestClient_getProjectRedirects_Walk(t *testing.T) {
+	type page struct {
+		statusCode int // 0 serves list below with a 200
+		list       types.RedirectList
+	}
+
+	tests := []struct {
+		name        string
+		limit       int
+		pages       []page
+		wantSources []string
+		// wantQueries is compared whole, so it also proves a cursor request
+		// carries no offset and vice versa.
+		wantQueries []string
+		wantErr     string
+	}{
+		{
+			name:  "cursor walk over several pages",
+			limit: 2,
+			pages: []page{
+				{list: types.RedirectList{Items: redirectsRange(0, 2), Total: 5, Limit: 2, Offset: 0, Next: "cur/1+="}},
+				{list: types.RedirectList{Items: redirectsRange(2, 2), Total: 5, Limit: 2, Offset: 2, Next: "cur2"}},
+				{list: types.RedirectList{Items: redirectsRange(4, 1), Total: 5, Limit: 2, Offset: 4}},
+			},
+			wantSources: []string{"/r0", "/r1", "/r2", "/r3", "/r4"},
+			wantQueries: []string{"limit=2&offset=0", "limit=2&cursor=cur%2F1%2B%3D", "limit=2&cursor=cur2"},
+		},
+		{
+			name:  "old server without cursor walks by offset",
+			limit: 2,
+			pages: []page{
+				{list: types.RedirectList{Items: redirectsRange(0, 2), Total: 5, Limit: 2, Offset: 0}},
+				{list: types.RedirectList{Items: redirectsRange(2, 2), Total: 5, Limit: 2, Offset: 2}},
+				{list: types.RedirectList{Items: redirectsRange(4, 1), Total: 5, Limit: 2, Offset: 4}},
+			},
+			wantSources: []string{"/r0", "/r1", "/r2", "/r3", "/r4"},
+			wantQueries: []string{"limit=2&offset=0", "limit=2&offset=2", "limit=2&offset=4"},
+		},
+		{
+			name:  "short page ends the walk",
+			limit: 5,
+			pages: []page{
+				{list: types.RedirectList{Items: redirectsRange(0, 3), Total: 99, Limit: 5, Offset: 0}},
+			},
+			wantSources: []string{"/r0", "/r1", "/r2"},
+			wantQueries: []string{"limit=5&offset=0"},
+		},
+		{
+			name:  "empty page ends the walk even when a cursor is still served",
+			limit: 2,
+			pages: []page{
+				{list: types.RedirectList{Items: redirectsRange(0, 2), Total: 100, Limit: 2, Offset: 0, Next: "cur1"}},
+				{list: types.RedirectList{Items: []types.Redirect{}, Total: 100, Limit: 2, Offset: 2, Next: "cur2"}},
+			},
+			wantSources: []string{"/r0", "/r1"},
+			wantQueries: []string{"limit=2&offset=0", "limit=2&cursor=cur1"},
+		},
+		{
+			name:  "non 200 mid walk propagates the error",
+			limit: 2,
+			pages: []page{
+				{list: types.RedirectList{Items: redirectsRange(0, 2), Total: 5, Limit: 2, Offset: 0, Next: "cur1"}},
+				{statusCode: http.StatusInternalServerError},
+			},
+			wantErr:     "unexpected status code for http://localhost:8080/api/namespace/test-ns/project/test-proj/redirects",
+			wantQueries: []string{"limit=2&offset=0", "limit=2&cursor=cur1"},
+		},
+		{
+			name:  "unset limit falls back to the default",
+			limit: 0,
+			pages: []page{
+				{list: types.RedirectList{Items: redirectsRange(0, 1), Total: 1, Limit: DefaultRedirectsLimit, Offset: 0}},
+			},
+			wantSources: []string{"/r0"},
+			wantQueries: []string{fmt.Sprintf("limit=%d&offset=0", DefaultRedirectsLimit)},
+		},
+		{
+			name:  "negative limit falls back to the default",
+			limit: -5,
+			pages: []page{
+				{list: types.RedirectList{Items: redirectsRange(0, 1), Total: 1, Limit: DefaultRedirectsLimit, Offset: 0}},
+			},
+			wantSources: []string{"/r0"},
+			wantQueries: []string{fmt.Sprintf("limit=%d&offset=0", DefaultRedirectsLimit)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, mockHTTP, _ := newTestClient()
+			c.cfg.RedirectsLimit = tt.limit
+			for _, p := range tt.pages {
+				if p.statusCode != 0 {
+					mockHTTP.expect(makeErrorResponse(p.statusCode), nil)
+					continue
+				}
+				mockHTTP.expect(makeListResponse(p.list), nil)
+			}
+
+			result, err := c.getProjectRedirects()
+
+			if tt.wantErr != "" {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				assert.Nil(t, result)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.wantSources, redirectSources(result))
+			}
+			assert.Equal(t, tt.wantQueries, queriesOf(mockHTTP.calls))
+		})
+	}
+}
+
+func TestClient_getProjectPages_Walk(t *testing.T) {
+	type page struct {
+		statusCode int // 0 serves list below with a 200
+		list       types.PageList
+	}
+
+	tests := []struct {
+		name        string
+		limit       int
+		pages       []page
+		wantPaths   []string
+		wantQueries []string
+		wantErr     string
+	}{
+		{
+			name:  "cursor walk over several pages",
+			limit: 2,
+			pages: []page{
+				{list: types.PageList{Items: pagesRange(0, 2), Total: 5, Limit: 2, Offset: 0, Next: "cur1"}},
+				{list: types.PageList{Items: pagesRange(2, 2), Total: 5, Limit: 2, Offset: 2, Next: "cur2"}},
+				{list: types.PageList{Items: pagesRange(4, 1), Total: 5, Limit: 2, Offset: 4}},
+			},
+			wantPaths:   []string{"/p0", "/p1", "/p2", "/p3", "/p4"},
+			wantQueries: []string{"limit=2&offset=0", "limit=2&cursor=cur1", "limit=2&cursor=cur2"},
+		},
+		{
+			name:  "old server without cursor walks by offset",
+			limit: 2,
+			pages: []page{
+				{list: types.PageList{Items: pagesRange(0, 2), Total: 3, Limit: 2, Offset: 0}},
+				{list: types.PageList{Items: pagesRange(2, 1), Total: 3, Limit: 2, Offset: 2}},
+			},
+			wantPaths:   []string{"/p0", "/p1", "/p2"},
+			wantQueries: []string{"limit=2&offset=0", "limit=2&offset=2"},
+		},
+		{
+			name:  "empty page ends the walk even when a cursor is still served",
+			limit: 2,
+			pages: []page{
+				{list: types.PageList{Items: pagesRange(0, 2), Total: 100, Limit: 2, Offset: 0, Next: "cur1"}},
+				{list: types.PageList{Items: []types.Page{}, Total: 100, Limit: 2, Offset: 2, Next: "cur2"}},
+			},
+			wantPaths:   []string{"/p0", "/p1"},
+			wantQueries: []string{"limit=2&offset=0", "limit=2&cursor=cur1"},
+		},
+		{
+			name:  "non 200 mid walk propagates the error",
+			limit: 2,
+			pages: []page{
+				{list: types.PageList{Items: pagesRange(0, 2), Total: 5, Limit: 2, Offset: 0, Next: "cur1"}},
+				{statusCode: http.StatusInternalServerError},
+			},
+			wantErr:     "unexpected status code for http://localhost:8080/api/namespace/test-ns/project/test-proj/pages",
+			wantQueries: []string{"limit=2&offset=0", "limit=2&cursor=cur1"},
+		},
+		{
+			name:  "unset limit falls back to the default",
+			limit: 0,
+			pages: []page{
+				{list: types.PageList{Items: pagesRange(0, 1), Total: 1, Limit: DefaultPagesLimit, Offset: 0}},
+			},
+			wantPaths:   []string{"/p0"},
+			wantQueries: []string{fmt.Sprintf("limit=%d&offset=0", DefaultPagesLimit)},
+		},
+		{
+			name:  "negative limit falls back to the default",
+			limit: -5,
+			pages: []page{
+				{list: types.PageList{Items: pagesRange(0, 1), Total: 1, Limit: DefaultPagesLimit, Offset: 0}},
+			},
+			wantPaths:   []string{"/p0"},
+			wantQueries: []string{fmt.Sprintf("limit=%d&offset=0", DefaultPagesLimit)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, mockHTTP, _ := newTestClient()
+			c.cfg.PagesLimit = tt.limit
+			for _, p := range tt.pages {
+				if p.statusCode != 0 {
+					mockHTTP.expect(makeErrorResponse(p.statusCode), nil)
+					continue
+				}
+				mockHTTP.expect(makeListResponse(p.list), nil)
+			}
+
+			result, err := c.getProjectPages()
+
+			if tt.wantErr != "" {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				assert.Nil(t, result)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.wantPaths, pagePaths(result))
+			}
+			assert.Equal(t, tt.wantQueries, queriesOf(mockHTTP.calls))
+		})
+	}
+}
+
+// trackedBody counts Close calls so a leaked connection shows up as zero.
+type trackedBody struct {
+	io.Reader
+	closed int
+}
+
+func (b *trackedBody) Close() error {
+	b.closed++
+	return nil
+}
+
+func TestClient_getProjectRedirects_ClosesBody(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		payload    string
+	}{
+		{
+			name:       "success",
+			statusCode: http.StatusOK,
+			payload:    `{"Items":[],"Total":0,"Limit":2,"Offset":0}`,
+		},
+		{
+			name:       "error status",
+			statusCode: http.StatusForbidden,
+			payload:    "forbidden",
+		},
+		{
+			name:       "invalid json",
+			statusCode: http.StatusOK,
+			payload:    "invalid json",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, mockHTTP, _ := newTestClient()
+			body := &trackedBody{Reader: bytes.NewBufferString(tt.payload)}
+			mockHTTP.expect(&http.Response{
+				StatusCode: tt.statusCode,
+				Status:     http.StatusText(tt.statusCode),
+				Body:       body,
+			}, nil)
+
+			_, _ = c.getProjectRedirects()
+
+			assert.Equal(t, 1, body.closed)
+		})
+	}
+}
+
+func TestClient_listingLimitsAreIndependent(t *testing.T) {
+	c, mockHTTP, _ := newTestClient()
+	c.cfg.RedirectsLimit = 2
+	c.cfg.PagesLimit = 3
+
+	mockHTTP.expect(makeListResponse(types.RedirectList{Items: redirectsRange(0, 1), Total: 1, Limit: 2, Offset: 0}), nil)
+	mockHTTP.expect(makeListResponse(types.PageList{Items: pagesRange(0, 1), Total: 1, Limit: 3, Offset: 0}), nil)
+
+	redirects, errRedirects := c.getProjectRedirects()
+	pages, errPages := c.getProjectPages()
+
+	assert.NoError(t, errRedirects)
+	assert.NoError(t, errPages)
+	assert.Equal(t, []string{"/r0"}, redirectSources(redirects))
+	assert.Equal(t, []string{"/p0"}, pagePaths(pages))
+	assert.Equal(t, []string{"limit=2&offset=0", "limit=3&offset=0"}, queriesOf(mockHTTP.calls))
 }
