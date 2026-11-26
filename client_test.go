@@ -1542,3 +1542,143 @@ func TestClient_listingLimitsAreIndependent(t *testing.T) {
 	assert.Equal(t, []string{"/p0"}, pagePaths(pages))
 	assert.Equal(t, []string{"limit=2&offset=0", "limit=3&offset=0"}, queriesOf(mockHTTP.calls))
 }
+
+func makeRawResponse(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewBufferString(body)),
+	}
+}
+
+// loadRawRedirects loads the client state from a raw redirects listing, as the
+// agent API sends it, so the JSON decoding is exercised as well.
+func loadRawRedirects(t *testing.T, items string) *client {
+	t.Helper()
+	c, mockHTTP, _ := newTestClient()
+	mockHTTP.expect(makeVersionResponse("1"), nil)
+	mockHTTP.expect(makeRawResponse(`{"Items":`+items+`,"Total":1,"Limit":100,"Offset":0}`), nil)
+	mockHTTP.expect(makeRawResponse(`{"Items":[],"Total":0,"Limit":100,"Offset":0}`), nil)
+	assert.NoError(t, c.loadState())
+	return c
+}
+
+func TestClient_getProjectRedirects_DecodeOptions(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+	tests := []struct {
+		name  string
+		items string
+		want  types.RedirectOptions
+	}{
+		{
+			name:  "options set",
+			items: `[{"type":"BASIC","source":"/a","target":"/b","status":"MOVED_PERMANENT","options":{"ignoreQueryString":true,"preserveQueryString":false}}]`,
+			want:  types.RedirectOptions{IgnoreQueryString: boolPtr(true), PreserveQueryString: boolPtr(false)},
+		},
+		{
+			name:  "empty options",
+			items: `[{"type":"BASIC","source":"/a","target":"/b","status":"MOVED_PERMANENT","options":{}}]`,
+			want:  types.RedirectOptions{},
+		},
+		{
+			name:  "no options from an old manager",
+			items: `[{"type":"BASIC","source":"/a","target":"/b","status":"MOVED_PERMANENT"}]`,
+			want:  types.RedirectOptions{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, mockHTTP, _ := newTestClient()
+			mockHTTP.expect(makeRawResponse(`{"Items":`+tt.items+`,"Total":1,"Limit":100,"Offset":0}`), nil)
+
+			got, err := c.getProjectRedirects()
+
+			assert.NoError(t, err)
+			if assert.Len(t, got, 1) {
+				assert.True(t, tt.want.Equal(got[0].Options), "got %+v", got[0].Options)
+			}
+		})
+	}
+}
+
+func TestClient_RedirectMatch_QueryStringOptions(t *testing.T) {
+	tests := []struct {
+		name       string
+		items      string
+		uri        string
+		wantSource string // empty means no match
+		wantTarget string
+	}{
+		{
+			name:       "ignoreQueryString matches any query string",
+			items:      `[{"type":"BASIC","source":"/a","target":"/b","status":"MOVED_PERMANENT","options":{"ignoreQueryString":true}}]`,
+			uri:        "/a?utm_source=x",
+			wantSource: "/a",
+			wantTarget: "/b",
+		},
+		{
+			name:  "without ignoreQueryString the query string must match",
+			items: `[{"type":"BASIC","source":"/a","target":"/b","status":"MOVED_PERMANENT"}]`,
+			uri:   "/a?utm_source=x",
+		},
+		{
+			name: "exact rule wins over ignore rule",
+			items: `[{"type":"BASIC","source":"/a","target":"/ignore","status":"MOVED_PERMANENT","options":{"ignoreQueryString":true}},` +
+				`{"type":"BASIC","source":"/a?x=1","target":"/exact","status":"MOVED_PERMANENT"}]`,
+			uri:        "/a?x=1",
+			wantSource: "/a?x=1",
+			wantTarget: "/exact",
+		},
+		{
+			name:       "preserveQueryString appends to a plain target",
+			items:      `[{"type":"BASIC","source":"/a","target":"/new","status":"MOVED_PERMANENT","options":{"ignoreQueryString":true,"preserveQueryString":true}}]`,
+			uri:        "/a?utm_source=x",
+			wantSource: "/a",
+			wantTarget: "/new?utm_source=x",
+		},
+		{
+			name:       "preserveQueryString keeps the target query string and skips shared keys",
+			items:      `[{"type":"BASIC","source":"/a","target":"/new?lang=fr","status":"MOVED_PERMANENT","options":{"ignoreQueryString":true,"preserveQueryString":true}}]`,
+			uri:        "/a?lang=en&utm_source=x",
+			wantSource: "/a",
+			wantTarget: "/new?lang=fr&utm_source=x",
+		},
+		{
+			name:       "preserveQueryString inserts before the fragment",
+			items:      `[{"type":"BASIC","source":"/a","target":"/new#top","status":"MOVED_PERMANENT","options":{"ignoreQueryString":true,"preserveQueryString":true}}]`,
+			uri:        "/a?utm_source=x",
+			wantSource: "/a",
+			wantTarget: "/new?utm_source=x#top",
+		},
+		{
+			name:       "payload without options matches as before",
+			items:      `[{"type":"BASIC","source":"/a","target":"/b","status":"MOVED_PERMANENT"}]`,
+			uri:        "/a",
+			wantSource: "/a",
+			wantTarget: "/b",
+		},
+		{
+			name:  "payload without options does not ignore the query string",
+			items: `[{"type":"BASIC","source":"/a","target":"/b","status":"MOVED_PERMANENT"}]`,
+			uri:   "/a?x=1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := loadRawRedirects(t, tt.items)
+
+			redirect, target := c.RedirectMatch("example.com", tt.uri)
+
+			if tt.wantSource == "" {
+				assert.Nil(t, redirect)
+				assert.Empty(t, target)
+				return
+			}
+			if assert.NotNil(t, redirect) {
+				assert.Equal(t, tt.wantSource, redirect.Source)
+			}
+			assert.Equal(t, tt.wantTarget, target)
+		})
+	}
+}
