@@ -3,7 +3,7 @@ module github.com/flectolab/go-client
 go 1.24.11
 
 require (
-	github.com/flectolab/flecto-manager/common v0.2.0
+	github.com/flectolab/flecto-manager/common v1.0.0
 	github.com/jonboulle/clockwork v0.4.0
 	github.com/stretchr/testify v1.11.1
 )
